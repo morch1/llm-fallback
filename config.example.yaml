@@ -3,15 +3,21 @@
 # Each model exposes one logical name to clients and is backed by an ordered
 # list of providers. On each request the providers are checked in order with a
 # plain TCP connectivity probe; the request is routed to the first one online.
+# Fallback also kicks in if a provider answers with an HTTP server error
+# (5xx, e.g. 502) or 429.
+#
+# retry_after (optional, seconds, default 0): after a provider fails, skip it
+# entirely for this many seconds before trying it again. 0 = retry every time.
 
 models:
   - name: gpt-4o
     providers:
-      # Tried first.
+      # Tried first. If it fails, don't probe it again for 30s.
       - url: https://api.openai.com/v1
         model_name: gpt-4o
         token: sk-your-openai-key
-      # Fallback if the one above is unreachable.
+        retry_after: 30
+      # Fallback if the one above is unreachable or errors.
       - url: http://localhost:11434/v1
         model_name: llama3.1:70b
         token: ollama

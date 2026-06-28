@@ -11,6 +11,13 @@ An OpenAI-compatible HTTP proxy that routes each model request to the first
 - For a request to model `m`, the providers listed for `m` are checked **in
   order** with a plain **TCP connectivity probe** (no LLM call is made to test
   availability). The request goes to the first provider that is online.
+- **Fallback also triggers on errors:** if a chosen provider answers with an
+  HTTP server error (5xx, e.g. `502 Bad Gateway`) or `429`, the router moves on
+  to the next provider. Other 4xx responses (e.g. `400`, `401`) are passed back
+  to the client unchanged, since they would fail identically everywhere.
+- **`retry_after` (optional, per provider, seconds, default `0`):** after a
+  provider fails, it is skipped outright — no availability check — for this many
+  seconds before being tried again. `0` means retry on every request.
 - Clients authenticate with an **access token**; each token is scoped to a set
   of model names it is allowed to use.
 
@@ -36,6 +43,7 @@ models:
       - url: https://api.openai.com/v1  # base url of an OpenAI-compatible API
         model_name: gpt-4o              # model name sent to this backend
         token: sk-...                   # auth token sent to this backend
+        retry_after: 30                 # optional; skip for 30s after a failure
       - url: http://localhost:11434/v1
         model_name: llama3.1:70b
         token: ollama

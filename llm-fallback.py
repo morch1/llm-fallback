@@ -3,8 +3,17 @@
 
 Starts an HTTP server that exposes an OpenAI-compatible API. Each configured
 model maps to an ordered list of backend providers. An incoming request for a
-model is routed to the first provider whose endpoint is reachable (a plain TCP
-connectivity check — no LLM request is made to probe availability).
+model is routed to the first usable provider, where a provider is tried when:
+
+  * it is not in a post-failure cooldown (see ``retry_after`` below), and
+  * its endpoint is reachable (a plain TCP connectivity check — no LLM request
+    is made to probe availability).
+
+Fallback to the next provider is triggered both when a provider is unreachable
+and when it responds with a server error (HTTP 5xx, e.g. 502 Bad Gateway) or
+429. A failed provider is put into cooldown for its ``retry_after`` seconds, and
+is skipped outright (no availability check) for that period. ``retry_after`` is
+optional and defaults to 0 (the provider is retried on every request).
 
 The proxy is intentionally transparent: request/response bodies, headers,
 status codes and streaming behaviour of the chosen provider are passed through
@@ -22,6 +31,7 @@ Config (YAML):
           - url: https://api.openai.com/v1
             model_name: gpt-4o
             token: sk-...
+            retry_after: 30        # optional, seconds; default 0
           - url: http://localhost:11434/v1
             model_name: llama3.1:70b
             token: ollama
@@ -34,6 +44,7 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional, Set
 from urllib.parse import urlsplit
@@ -61,10 +72,23 @@ HOP_BY_HOP = {
 class Provider:
     """A single backend OpenAI-compatible endpoint for a model."""
 
-    def __init__(self, url: str, model_name: str, token: str):
+    def __init__(
+        self, url: str, model_name: str, token: str, retry_after: float = 0.0
+    ):
         self.url = url.rstrip("/")
         self.model_name = model_name
         self.token = token
+
+        try:
+            self.retry_after = float(retry_after)
+        except (TypeError, ValueError):
+            raise ValueError(f"retry_after must be a number, got {retry_after!r}")
+        if self.retry_after < 0:
+            raise ValueError("retry_after must be >= 0")
+
+        # Monotonic timestamp before which this provider is skipped outright
+        # (no availability check, no request). 0 means "eligible now".
+        self.cooldown_until: float = 0.0
 
         parts = urlsplit(url)
         if not parts.hostname:
@@ -73,6 +97,18 @@ class Provider:
         self.port: int = parts.port or (443 if parts.scheme == "https" else 80)
         # Path component of the base url, e.g. "/v1" for https://host/v1
         self.base_path: str = parts.path.rstrip("/")
+
+    def in_cooldown(self) -> bool:
+        """True if this provider failed recently and is still within retry_after."""
+        return time.monotonic() < self.cooldown_until
+
+    def mark_failed(self) -> None:
+        """Record a failure; the provider is skipped for retry_after seconds.
+
+        With the default retry_after of 0 this is a no-op in practice — the
+        provider becomes eligible again on the very next request.
+        """
+        self.cooldown_until = time.monotonic() + self.retry_after
 
     def target_url(self, request_path: str) -> str:
         """Combine this provider's base url with the incoming request path.
@@ -157,7 +193,14 @@ def load_config(path: str) -> None:
                     f"provider of model {name!r} missing fields: {', '.join(missing)}"
                 )
             try:
-                providers.append(Provider(p["url"], p["model_name"], p["token"]))
+                providers.append(
+                    Provider(
+                        p["url"],
+                        p["model_name"],
+                        p["token"],
+                        p.get("retry_after", 0),
+                    )
+                )
             except ValueError as exc:
                 sys.exit(f"model {name!r}: {exc}")
 
@@ -230,12 +273,16 @@ async def is_reachable(host: str, port: int, timeout: float = 3.0) -> bool:
     return True
 
 
-async def select_provider(model: Model) -> Optional[Provider]:
-    """Return the first provider (in config order) that is reachable."""
-    for provider in model.providers:
-        if await is_reachable(provider.host, provider.port):
-            return provider
-    return None
+def is_failure_status(status: int) -> bool:
+    """Statuses that should trigger fallback to the next provider.
+
+    Server errors (5xx, e.g. 502 Bad Gateway / 503 / 504) and rate limiting
+    (429) are treated as the provider being unable to serve the request, so we
+    fall through to the next one. Other 4xx responses (400, 401, 404, ...) are
+    request-level errors that would fail identically on every provider, so they
+    are passed back to the client transparently instead.
+    """
+    return status >= 500 or status == 429
 
 
 @app.api_route(
@@ -299,59 +346,83 @@ async def proxy(full_path: str, request: Request):
             "model_not_found",
         )
 
-    # --- pick first reachable provider -----------------------------------
-    provider = await select_provider(model)
-    if provider is None:
-        return error_response(
-            503,
-            f"No available provider for model '{requested_model}'.",
-            "service_unavailable",
-            "no_provider_available",
-        )
+    assert payload is not None  # requested_model was read from payload
 
-    # --- rewrite body (model name) and headers (auth token) --------------
-    payload["model"] = provider.model_name
-    new_body = json.dumps(payload).encode("utf-8")
-
-    fwd_headers = {
+    # Headers shared across providers; the authorization header is set per
+    # provider below since each backend has its own token.
+    base_headers = {
         k: v
         for k, v in request.headers.items()
         if k.lower() not in HOP_BY_HOP
         and k.lower() not in ("host", "content-length", "authorization", "api-key")
     }
-    fwd_headers["authorization"] = f"Bearer {provider.token}"
+    query = request.url.query
 
-    target = provider.target_url(path)
-    if request.url.query:
-        target = f"{target}?{request.url.query}"
+    # --- try providers in order, falling back on failure -----------------
+    last_failure: Optional[str] = None
+    for provider in model.providers:
+        # Skip providers still in their post-failure cooldown window.
+        if provider.in_cooldown():
+            last_failure = f"{provider.url} in cooldown"
+            continue
 
-    # --- forward transparently, streaming the response back --------------
-    upstream_req = client.build_request(
-        request.method, target, headers=fwd_headers, content=new_body
-    )
-    try:
-        upstream_resp = await client.send(upstream_req, stream=True)
-    except httpx.HTTPError as exc:
-        return error_response(
-            502,
-            f"Failed to reach provider for model '{requested_model}': {exc}",
-            "service_unavailable",
-            "provider_request_failed",
+        # Plain TCP availability check (no LLM request).
+        if not await is_reachable(provider.host, provider.port):
+            provider.mark_failed()
+            last_failure = f"{provider.url} unreachable"
+            continue
+
+        # Rewrite body (model name) and headers (auth token) per provider.
+        payload["model"] = provider.model_name
+        new_body = json.dumps(payload).encode("utf-8")
+        fwd_headers = dict(base_headers)
+        fwd_headers["authorization"] = f"Bearer {provider.token}"
+
+        target = provider.target_url(path)
+        if query:
+            target = f"{target}?{query}"
+
+        upstream_req = client.build_request(
+            request.method, target, headers=fwd_headers, content=new_body
+        )
+        try:
+            upstream_resp = await client.send(upstream_req, stream=True)
+        except httpx.HTTPError as exc:
+            provider.mark_failed()
+            last_failure = f"{provider.url} request error: {exc}"
+            continue
+
+        # An HTTP error status (5xx/429) means this provider could not serve
+        # the request — close it and fall through to the next provider.
+        if is_failure_status(upstream_resp.status_code):
+            status = upstream_resp.status_code
+            await upstream_resp.aclose()
+            provider.mark_failed()
+            last_failure = f"{provider.url} returned HTTP {status}"
+            continue
+
+        # Success (or a non-retryable client error) — stream it back as-is.
+        resp_headers = {
+            k: v
+            for k, v in upstream_resp.headers.items()
+            if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
+        }
+        media_type = resp_headers.pop("content-type", None)
+        return StreamingResponse(
+            upstream_resp.aiter_raw(),
+            status_code=upstream_resp.status_code,
+            headers=resp_headers,
+            media_type=media_type,
+            background=BackgroundTask(upstream_resp.aclose),
         )
 
-    resp_headers = {
-        k: v
-        for k, v in upstream_resp.headers.items()
-        if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
-    }
-    media_type = resp_headers.pop("content-type", None)
-
-    return StreamingResponse(
-        upstream_resp.aiter_raw(),
-        status_code=upstream_resp.status_code,
-        headers=resp_headers,
-        media_type=media_type,
-        background=BackgroundTask(upstream_resp.aclose),
+    # No provider could serve the request.
+    return error_response(
+        503,
+        f"No available provider for model '{requested_model}'"
+        + (f" (last: {last_failure})." if last_failure else "."),
+        "service_unavailable",
+        "no_provider_available",
     )
 
 
