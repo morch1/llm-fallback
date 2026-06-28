@@ -1,0 +1,35 @@
+# Example configuration for llm-fallback.py
+#
+# Each model exposes one logical name to clients and is backed by an ordered
+# list of providers. On each request the providers are checked in order with a
+# plain TCP connectivity probe; the request is routed to the first one online.
+
+models:
+  - name: gpt-4o
+    providers:
+      # Tried first.
+      - url: https://api.openai.com/v1
+        model_name: gpt-4o
+        token: sk-your-openai-key
+      # Fallback if the one above is unreachable.
+      - url: http://localhost:11434/v1
+        model_name: llama3.1:70b
+        token: ollama
+
+  - name: fast
+    providers:
+      - url: http://localhost:11434/v1
+        model_name: llama3.1:8b
+        token: ollama
+
+# Access tokens clients use to authenticate against THIS server.
+# Each token lists which model names it may request.
+tokens:
+  - token: my-secret-access-token
+    models:
+      - gpt-4o
+      - fast
+
+  - token: limited-token
+    models:
+      - fast
