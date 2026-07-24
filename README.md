@@ -18,6 +18,14 @@ An OpenAI-compatible HTTP proxy that routes each model request to the first
 - **`retry_after` (optional, per provider, seconds, default `0`):** after a
   provider fails, it is skipped outright — no availability check — for this many
   seconds before being tried again. `0` means retry on every request.
+- **`wake` (optional, per provider):** if the provider is unreachable, send a
+  **Wake-on-LAN** magic packet to wake the machine, then retry the request.
+  Fields:
+  - ``mac_address`` — MAC address of the provider's machine (required)
+  - ``max_retries`` — number of WoL + retry attempts (default `1`, minimum `1`)
+  - ``retry_delay`` — seconds to wait after each WoL packet before retrying
+    (default `1.0`)
+  If all retries fail, the normal fallback chain continues to the next provider.
 - Clients authenticate with an **access token**; each token is scoped to a set
   of model names it is allowed to use.
 
@@ -44,9 +52,13 @@ models:
         model_name: gpt-4o              # model name sent to this backend
         token: sk-...                   # auth token sent to this backend
         retry_after: 30                 # optional; skip for 30s after a failure
-      - url: http://localhost:11434/v1
+      - url: http://192.168.1.50:11434/v1
         model_name: llama3.1:70b
         token: ollama
+        wake:                           # optional; wake the machine on failure
+          mac_address: "aa:bb:cc:dd:ee:ff"
+          max_retries: 3                # default 1
+          retry_delay: 5                # default 1.0 (seconds)
 
 tokens:
   - token: my-secret-access-token     # token clients send to THIS server
