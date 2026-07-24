@@ -105,7 +105,7 @@ async def send_wol(mac_address: str, host: str) -> None:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     try:
         # Broadcast to the local subnet.
-        sock.sendto(packet, ("255.255.255.255", 0))
+        sock.sendto(packet, ("255.255.255.255", 9))
     finally:
         sock.close()
 
