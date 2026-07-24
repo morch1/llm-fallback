@@ -8,6 +8,12 @@
 #
 # retry_after (optional, seconds, default 0): after a provider fails, skip it
 # entirely for this many seconds before trying it again. 0 = retry every time.
+#
+# wake (optional): if the provider is unreachable, send a Wake-on-LAN magic
+# packet to the given mac_address and retry. Fields:
+#   mac_address  — MAC of the provider's machine (required)
+#   max_retries  — number of WoL retries (default 1, min 1)
+#   retry_delay  — seconds to wait after each WoL packet (default 1.0)
 
 models:
   - name: gpt-4o
@@ -15,12 +21,23 @@ models:
       # Tried first. If it fails, don't probe it again for 30s.
       - url: https://api.openai.com/v1
         model_name: gpt-4o
-        token: sk-your-openai-key
+        token: «redacted:sk-…»
         retry_after: 30
       # Fallback if the one above is unreachable or errors.
       - url: http://localhost:11434/v1
         model_name: llama3.1:70b
         token: ollama
+
+  - name: local-llm
+    providers:
+      - url: http://192.168.1.50:11434/v1
+        model_name: llama3.1:70b
+        token: ollama
+        retry_after: 60
+        wake:
+          mac_address: "aa:bb:cc:dd:ee:ff"
+          max_retries: 3
+          retry_delay: 5
 
   - name: fast
     providers:

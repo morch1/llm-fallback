@@ -43,6 +43,8 @@ Config (YAML):
 import argparse
 import asyncio
 import json
+import re
+import socket
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -68,12 +70,56 @@ HOP_BY_HOP = {
     "upgrade",
 }
 
+# MAC address pattern: six groups of two hex digits separated by colons or hyphens.
+_MAC_RE = re.compile(r"^([0-9a-fA-F]{2}[:\-]){5}[0-9a-fA-F]{2}$")
+
+
+def validate_mac_address(mac: str) -> str:
+    """Validate and normalise a MAC address string.
+
+    Returns the lower-cased, colon-separated MAC address.
+    Raises ``ValueError`` if the format is invalid.
+    """
+    if not _MAC_RE.match(mac):
+        raise ValueError(
+            f"invalid mac_address {mac!r}: expected 6 pairs of hex digits "
+            "separated by ':' or '-'"
+        )
+    return mac.replace("-", ":").lower()
+
+
+async def send_wol(mac_address: str, host: str) -> None:
+    """Send a Wake-on-LAN magic packet to *mac_address*.
+
+    The packet is sent via UDP to the local-link broadcast address
+    (``255.255.255.255``) on port 0, targeting the same subnet as the
+    provider's *host*.
+    """
+    # Parse the MAC into 6 bytes.
+    mac_bytes = bytes.fromhex(mac_address.replace(":", ""))
+
+    # Magic packet: 6 × 0xFF followed by the MAC repeated 16 times.
+    packet = b"\xff" * 6 + mac_bytes * 16
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    try:
+        # Broadcast to the local subnet.
+        sock.sendto(packet, ("255.255.255.255", 0))
+    finally:
+        sock.close()
+
 
 class Provider:
     """A single backend OpenAI-compatible endpoint for a model."""
 
     def __init__(
-        self, url: str, model_name: str, token: str, retry_after: float = 0.0
+        self,
+        url: str,
+        model_name: str,
+        token: str,
+        retry_after: float = 0.0,
+        wake: Optional[Dict] = None,
     ):
         self.url = url.rstrip("/")
         self.model_name = model_name
@@ -97,6 +143,30 @@ class Provider:
         self.port: int = parts.port or (443 if parts.scheme == "https" else 80)
         # Path component of the base url, e.g. "/v1" for https://host/v1
         self.base_path: str = parts.path.rstrip("/")
+
+        # --- Wake-on-LAN config (optional) --------------------------------
+        self.wol_mac: Optional[str] = None
+        self.wol_max_retries: int = 0
+        self.wol_retry_delay: float = 1.0
+
+        if wake:
+            if not isinstance(wake, dict):
+                raise ValueError("wake must be a mapping")
+            mac = wake.get("mac_address")
+            if not mac:
+                raise ValueError(
+                    "wake requires 'mac_address' (e.g. 'aa:bb:cc:dd:ee:ff')"
+                )
+            self.wol_mac = validate_mac_address(mac)
+            self.wol_max_retries = int(wake.get("max_retries", 1))
+            if self.wol_max_retries < 1:
+                raise ValueError("wake.max_retries must be >= 1")
+            try:
+                self.wol_retry_delay = float(wake.get("retry_delay", 1.0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"wake.retry_delay must be a number") from exc
+            if self.wol_retry_delay < 0:
+                raise ValueError("wake.retry_delay must be >= 0")
 
     def in_cooldown(self) -> bool:
         """True if this provider failed recently and is still within retry_after."""
@@ -199,6 +269,7 @@ def load_config(path: str) -> None:
                         p["model_name"],
                         p["token"],
                         p.get("retry_after", 0),
+                        p.get("wake"),
                     )
                 )
             except ValueError as exc:
@@ -366,55 +437,73 @@ async def proxy(full_path: str, request: Request):
             last_failure = f"{provider.url} in cooldown"
             continue
 
-        # Plain TCP availability check (no LLM request).
-        if not await is_reachable(provider.host, provider.port):
-            provider.mark_failed()
+        # --- helper: attempt a single request to this provider ------------
+        async def _try_provider() -> Optional[StreamingResponse]:
+            # Plain TCP availability check (no LLM request).
+            if not await is_reachable(provider.host, provider.port):
+                return None
+
+            # Rewrite body (model name) and headers (auth token) per provider.
+            payload["model"] = provider.model_name
+            new_body = json.dumps(payload).encode("utf-8")
+            fwd_headers = dict(base_headers)
+            fwd_headers["authorization"] = f"Bearer {provider.token}"
+
+            target = provider.target_url(path)
+            if query:
+                target = f"{target}?{query}"
+
+            upstream_req = client.build_request(
+                request.method, target, headers=fwd_headers, content=new_body
+            )
+            try:
+                upstream_resp = await client.send(upstream_req, stream=True)
+            except httpx.HTTPError as exc:
+                last_failure = f"{provider.url} request error: {exc}"
+                return None
+
+            # An HTTP error status (5xx/429) means this provider could not serve
+            # the request — close it and fall through to the next provider.
+            if is_failure_status(upstream_resp.status_code):
+                status = upstream_resp.status_code
+                await upstream_resp.aclose()
+                last_failure = f"{provider.url} returned HTTP {status}"
+                return None
+
+            # Success (or a non-retryable client error) — stream it back as-is.
+            resp_headers = {
+                k: v
+                for k, v in upstream_resp.headers.items()
+                if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
+            }
+            media_type = resp_headers.pop("content-type", None)
+            return StreamingResponse(
+                upstream_resp.aiter_raw(),
+                status_code=upstream_resp.status_code,
+                headers=resp_headers,
+                media_type=media_type,
+                background=BackgroundTask(upstream_resp.aclose),
+            )
+
+        # Initial attempt.
+        result = await _try_provider()
+        if result is not None:
+            return result
+
+        # --- Wake-on-LAN retry loop ----------------------------------------
+        if provider.wol_mac:
+            for attempt in range(provider.wol_max_retries):
+                await send_wol(provider.wol_mac, provider.host)
+                await asyncio.sleep(provider.wol_retry_delay)
+                result = await _try_provider()
+                if result is not None:
+                    return result
+
+        # Provider exhausted (with or without WoL retries).
+        provider.mark_failed()
+        if last_failure is None:
             last_failure = f"{provider.url} unreachable"
-            continue
-
-        # Rewrite body (model name) and headers (auth token) per provider.
-        payload["model"] = provider.model_name
-        new_body = json.dumps(payload).encode("utf-8")
-        fwd_headers = dict(base_headers)
-        fwd_headers["authorization"] = f"Bearer {provider.token}"
-
-        target = provider.target_url(path)
-        if query:
-            target = f"{target}?{query}"
-
-        upstream_req = client.build_request(
-            request.method, target, headers=fwd_headers, content=new_body
-        )
-        try:
-            upstream_resp = await client.send(upstream_req, stream=True)
-        except httpx.HTTPError as exc:
-            provider.mark_failed()
-            last_failure = f"{provider.url} request error: {exc}"
-            continue
-
-        # An HTTP error status (5xx/429) means this provider could not serve
-        # the request — close it and fall through to the next provider.
-        if is_failure_status(upstream_resp.status_code):
-            status = upstream_resp.status_code
-            await upstream_resp.aclose()
-            provider.mark_failed()
-            last_failure = f"{provider.url} returned HTTP {status}"
-            continue
-
-        # Success (or a non-retryable client error) — stream it back as-is.
-        resp_headers = {
-            k: v
-            for k, v in upstream_resp.headers.items()
-            if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
-        }
-        media_type = resp_headers.pop("content-type", None)
-        return StreamingResponse(
-            upstream_resp.aiter_raw(),
-            status_code=upstream_resp.status_code,
-            headers=resp_headers,
-            media_type=media_type,
-            background=BackgroundTask(upstream_resp.aclose),
-        )
+        continue
 
     # No provider could serve the request.
     return error_response(
