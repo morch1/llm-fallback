@@ -1,49 +1,57 @@
 # Example configuration for llm-fallback.py
 #
-# Each model exposes one logical name to clients and is backed by an ordered
-# list of providers. On each request the providers are checked in order with a
-# plain TCP connectivity probe; the request is routed to the first one online.
-# Fallback also kicks in if a provider answers with an HTTP server error
-# (5xx, e.g. 502) or 429.
+# Providers are defined once at the top level and referenced by models.
+# Each provider has an id, url, and token. Optional fields:
 #
-# retry_after (optional, seconds, default 0): after a provider fails, skip it
-# entirely for this many seconds before trying it again. 0 = retry every time.
+#   retry_after (seconds, default 0): after a provider fails, skip it
+#   entirely for this many seconds before trying it again. 0 = retry every time.
 #
-# wake (optional): if the provider is unreachable, send a Wake-on-LAN magic
-# packet to the given mac_address and retry. Fields:
-#   mac_address  — MAC of the provider's machine (required)
-#   max_retries  — number of WoL retries (default 1, min 1)
-#   retry_delay  — seconds to wait after each WoL packet (default 1.0)
+#   wake (optional): if the provider is unreachable, send a Wake-on-LAN magic
+#   packet to the given mac_address and retry. Fields:
+#     mac_address  — MAC of the provider's machine (required)
+#     max_retries  — number of WoL retries (default 1, min 1)
+#     retry_delay  — seconds to wait after each WoL packet (default 1.0)
 
+providers:
+  - id: openai
+    url: https://api.openai.com/v1
+    token: «redacted:sk-…»
+    retry_after: 30
+
+  - id: ollama
+    url: http://localhost:11434/v1
+    token: ollama
+
+  - id: remote-ollama
+    url: http://192.168.1.50:11434/v1
+    token: ollama
+    retry_after: 60
+    wake:
+      mac_address: "aa:bb:cc:dd:ee:ff"
+      max_retries: 3
+      retry_delay: 5
+
+# Models reference providers by id and optionally override the model name.
+# If model_name is omitted, the provider uses the model's own "name" field.
 models:
   - name: gpt-4o
     providers:
       # Tried first. If it fails, don't probe it again for 30s.
-      - url: https://api.openai.com/v1
+      - id: openai
         model_name: gpt-4o
-        token: «redacted:sk-…»
-        retry_after: 30
       # Fallback if the one above is unreachable or errors.
-      - url: http://localhost:11434/v1
+      - id: ollama
         model_name: llama3.1:70b
-        token: ollama
 
   - name: local-llm
     providers:
-      - url: http://192.168.1.50:11434/v1
+      - id: remote-ollama
         model_name: llama3.1:70b
-        token: ollama
-        retry_after: 60
-        wake:
-          mac_address: "aa:bb:cc:dd:ee:ff"
-          max_retries: 3
-          retry_delay: 5
 
   - name: fast
     providers:
-      - url: http://localhost:11434/v1
+      - id: ollama
         model_name: llama3.1:8b
-        token: ollama
 
 # Access tokens clients use to authenticate against THIS server.
 # Each token lists which model names it may request.

@@ -25,16 +25,21 @@ Usage:
     python llm-fallback.py --config config.yaml [--host 0.0.0.0] [--port 8000]
 
 Config (YAML):
+    providers:
+      - id: openai
+        url: https://api.openai.com/v1
+        token: sk-...
+        retry_after: 30        # optional, seconds; default 0
+      - id: ollama
+        url: http://localhost:11434/v1
+        token: ollama
     models:
       - name: gpt-4o
         providers:
-          - url: https://api.openai.com/v1
-            model_name: gpt-4o
-            token: sk-...
-            retry_after: 30        # optional, seconds; default 0
-          - url: http://localhost:11434/v1
+          - id: openai
+            model_name: gpt-4o   # optional; defaults to model's name
+          - id: ollama
             model_name: llama3.1:70b
-            token: ollama
     tokens:
       - token: my-secret-access-token
         models: [gpt-4o]
@@ -115,14 +120,14 @@ class Provider:
 
     def __init__(
         self,
+        id: str,
         url: str,
-        model_name: str,
         token: str,
         retry_after: float = 0.0,
         wake: Optional[Dict] = None,
     ):
+        self.id = id
         self.url = url.rstrip("/")
-        self.model_name = model_name
         self.token = token
 
         try:
@@ -193,15 +198,25 @@ class Provider:
         return self.url + path
 
 
-class Model:
-    """A logical model name backed by an ordered list of providers."""
+class ModelProviderRef:
+    """Reference to a shared Provider with a model-specific model_name override."""
+    __slots__ = ("provider", "model_name")
 
-    def __init__(self, name: str, providers: List[Provider]):
+    def __init__(self, provider: Provider, model_name: str):
+        self.provider = provider
+        self.model_name = model_name
+
+
+class Model:
+    """A logical model name backed by an ordered list of provider references."""
+
+    def __init__(self, name: str, providers: List[ModelProviderRef]):
         self.name = name
         self.providers = providers
 
 
 # Populated by load_config() before the server starts.
+PROVIDERS: Dict[str, "Provider"] = {}
 MODELS: Dict[str, Model] = {}
 TOKENS: Dict[str, Set[str]] = {}
 
@@ -227,7 +242,7 @@ app = FastAPI(title="llm-fallback", docs_url=None, redoc_url=None, lifespan=life
 
 
 def load_config(path: str) -> None:
-    """Load and validate the YAML config into the MODELS/TOKENS globals."""
+    """Load and validate the YAML config into the PROVIDERS/MODELS/TOKENS globals."""
     try:
         with open(path, "r") as fh:
             raw = yaml.safe_load(fh)
@@ -237,8 +252,38 @@ def load_config(path: str) -> None:
         sys.exit(f"failed to parse config {path}: {exc}")
 
     if not isinstance(raw, dict):
-        sys.exit("config root must be a mapping with 'models' and 'tokens'")
+        sys.exit("config root must be a mapping with 'providers', 'models', and 'tokens'")
 
+    # --- parse top-level providers ----------------------------------------
+    providers_raw = raw.get("providers")
+    if not isinstance(providers_raw, list) or not providers_raw:
+        sys.exit("config must define a non-empty 'providers' list")
+
+    for entry in providers_raw:
+        if not isinstance(entry, dict):
+            sys.exit("each provider must be a mapping")
+        pid = entry.get("id")
+        if not pid:
+            sys.exit("each provider needs an 'id'")
+        if pid in PROVIDERS:
+            sys.exit(f"duplicate provider id: {pid!r}")
+        missing = [k for k in ("url", "token") if not entry.get(k)]
+        if missing:
+            sys.exit(
+                f"provider {pid!r} missing fields: {', '.join(missing)}"
+            )
+        try:
+            PROVIDERS[pid] = Provider(
+                pid,
+                entry["url"],
+                entry["token"],
+                entry.get("retry_after", 0),
+                entry.get("wake"),
+            )
+        except ValueError as exc:
+            sys.exit(f"provider {pid!r}: {exc}")
+
+    # --- parse models -----------------------------------------------------
     models_cfg = raw.get("models")
     if not isinstance(models_cfg, list) or not models_cfg:
         sys.exit("config must define a non-empty 'models' list")
@@ -253,31 +298,24 @@ def load_config(path: str) -> None:
         if not isinstance(providers_cfg, list) or not providers_cfg:
             sys.exit(f"model {name!r} must define a non-empty 'providers' list")
 
-        providers: List[Provider] = []
+        refs: List[ModelProviderRef] = []
         for p in providers_cfg:
             if not isinstance(p, dict):
-                sys.exit(f"each provider of model {name!r} must be a mapping")
-            missing = [k for k in ("url", "model_name", "token") if not p.get(k)]
-            if missing:
+                sys.exit(f"each provider reference of model {name!r} must be a mapping")
+            provider_id = p.get("id")
+            if not provider_id:
+                sys.exit(f"provider reference of model {name!r} missing 'id'")
+            if provider_id not in PROVIDERS:
                 sys.exit(
-                    f"provider of model {name!r} missing fields: {', '.join(missing)}"
+                    f"model {name!r} references unknown provider {provider_id!r} "
+                    f"(not defined in 'providers')"
                 )
-            try:
-                providers.append(
-                    Provider(
-                        p["url"],
-                        p["model_name"],
-                        p["token"],
-                        p.get("retry_after", 0),
-                        p.get("wake"),
-                    )
-                )
-            except ValueError as exc:
-                sys.exit(f"model {name!r}: {exc}")
+            model_name = p.get("model_name", name)
+            refs.append(ModelProviderRef(PROVIDERS[provider_id], model_name))
 
         if name in MODELS:
             sys.exit(f"duplicate model name: {name!r}")
-        MODELS[name] = Model(name, providers)
+        MODELS[name] = Model(name, refs)
 
     tokens_cfg = raw.get("tokens")
     if not isinstance(tokens_cfg, list) or not tokens_cfg:
@@ -431,7 +469,8 @@ async def proxy(full_path: str, request: Request):
 
     # --- try providers in order, falling back on failure -----------------
     last_failure: Optional[str] = None
-    for provider in model.providers:
+    for ref in model.providers:
+        provider = ref.provider
         # Skip providers still in their post-failure cooldown window.
         if provider.in_cooldown():
             last_failure = f"{provider.url} in cooldown"
@@ -444,7 +483,7 @@ async def proxy(full_path: str, request: Request):
                 return None
 
             # Rewrite body (model name) and headers (auth token) per provider.
-            payload["model"] = provider.model_name
+            payload["model"] = ref.model_name
             new_body = json.dumps(payload).encode("utf-8")
             fwd_headers = dict(base_headers)
             fwd_headers["authorization"] = f"Bearer {provider.token}"

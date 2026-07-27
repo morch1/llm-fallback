@@ -8,8 +8,9 @@ An OpenAI-compatible HTTP proxy that routes each model request to the first
 - Exposes a transparent OpenAI-compatible API. Request/response bodies, headers,
   status codes and streaming are passed through unchanged — only the **model
   name** and **auth token** are rewritten for the chosen backend.
-- For a request to model `m`, the providers listed for `m` are checked **in
-  order** with a plain **TCP connectivity probe** (no LLM call is made to test
+- Providers are defined once at the top level and referenced by models. For a
+  request to model `m`, the providers listed for `m` are checked **in order**
+  with a plain **TCP connectivity probe** (no LLM call is made to test
   availability). The request goes to the first provider that is online.
 - **Fallback also triggers on errors:** if a chosen provider answers with an
   HTTP server error (5xx, e.g. `502 Bad Gateway`) or `429`, the router moves on
@@ -45,24 +46,32 @@ python llm-fallback.py --config config.yaml [--host 0.0.0.0] [--port 8000]
 ## Configuration
 
 ```yaml
+providers:
+  - id: openai                          # unique identifier
+    url: https://api.openai.com/v1       # base url of an OpenAI-compatible API
+    token: sk-...                        # auth token sent to this backend
+    retry_after: 30                      # optional; skip for 30s after a failure
+
+  - id: remote-ollama
+    url: http://192.168.1.50:11434/v1
+    token: ollama
+    wake:                                # optional; wake the machine on failure
+      mac_address: "aa:bb:cc:dd:ee:ff"
+      max_retries: 3                     # default 1
+      retry_delay: 5                     # default 1.0 (seconds)
+
 models:
-  - name: gpt-4o                      # name clients request
-    providers:                        # tried in this order
-      - url: https://api.openai.com/v1  # base url of an OpenAI-compatible API
-        model_name: gpt-4o              # model name sent to this backend
-        token: sk-...                   # auth token sent to this backend
-        retry_after: 30                 # optional; skip for 30s after a failure
-      - url: http://192.168.1.50:11434/v1
+  - name: gpt-4o                        # name clients request
+    providers:                           # tried in this order
+      - id: openai
+        model_name: gpt-4o               # optional; model name sent to backend
+                                          # if omitted, defaults to model's "name"
+      - id: remote-ollama
         model_name: llama3.1:70b
-        token: ollama
-        wake:                           # optional; wake the machine on failure
-          mac_address: "aa:bb:cc:dd:ee:ff"
-          max_retries: 3                # default 1
-          retry_delay: 5                # default 1.0 (seconds)
 
 tokens:
-  - token: my-secret-access-token     # token clients send to THIS server
-    models: [gpt-4o]                  # models this token may use
+  - token: my-secret-access-token       # token clients send to THIS server
+    models: [gpt-4o]                    # models this token may use
 ```
 
 See [config.example.yaml](config.example.yaml).
@@ -74,6 +83,13 @@ is appended to it; a shared prefix is not duplicated, so both
 `https://host/v1` and `https://host` work for a client calling
 `/v1/chat/completions`.
 
+### Model `providers` entries
+
+Each entry references a top-level provider by `id` and optionally overrides the
+`model_name` sent to that backend. When `model_name` is omitted, the model's
+own `name` is used, which is convenient when the same model name exists on
+multiple backends.
+
 ## Example
 
 ```bash
@@ -84,3 +100,16 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 `GET /v1/models` returns the models the presented token may access.
+
+## Tests
+
+126 tests covering config validation, provider routing, authentication,
+fallback logic, cooldown behaviour, Wake-on-LAN, and header forwarding.
+
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
+
+Works on both Linux and Windows. No external services required — all backend
+interactions are mocked.
