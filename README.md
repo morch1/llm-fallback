@@ -43,6 +43,23 @@ pip install -r requirements.txt
 python llm-fallback.py --config config.yaml [--host 0.0.0.0] [--port 8000]
 ```
 
+## Docker
+
+Build the image and run it with the configuration bind-mounted read-only at
+`/etc/llm-fallback.yaml`:
+
+```bash
+docker build -t llm-fallback .
+docker run --rm \
+  --mount type=bind,source="$(pwd)/config.yaml",target=/etc/llm-fallback.yaml,readonly \
+  -p 8000:8000 \
+  llm-fallback
+```
+
+The app keeps its defaults of `0.0.0.0:8000` inside the container. To expose it
+on a different host port, change only the first port in the mapping (for
+example, `-p 8080:8000`).
+
 ## Configuration
 
 ```yaml

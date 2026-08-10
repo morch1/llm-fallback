@@ -1,0 +1,11 @@
+{
+  "name": "${localWorkspaceFolderBasename} - pi-box devcontainer",
+  "dockerComposeFile": "compose.yaml",
+  "service": "devcontainer",
+  "containerUser": "pi",
+  "remoteUser": "pi",
+  "updateRemoteUserUID": true,
+  "workspaceFolder": "/workspace/${localWorkspaceFolderBasename}",
+  "postCreateCommand": ".devcontainer/lifecycle.sh postCreate",
+  "initializeCommand": "chmod +x .devcontainer/lifecycle.sh && .devcontainer/lifecycle.sh init"
+}

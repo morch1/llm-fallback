@@ -1,0 +1,27 @@
+[project]
+name = "llm-fallback"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "morch1", email = "70644384+morch1@users.noreply.github.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "pyyaml>=6.0.3",
+    "uvicorn>=0.52.3",
+]
+
+[project.scripts]
+llm-fallback = "llm_fallback:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
