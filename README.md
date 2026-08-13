@@ -32,15 +32,17 @@ An OpenAI-compatible HTTP proxy that routes each model request to the first
 
 ## Install
 
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then sync the
+project environment and dependencies:
+
 ```bash
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
+uv sync
 ```
 
 ## Run
 
 ```bash
-python llm-fallback.py --config config.yaml [--host 0.0.0.0] [--port 8000]
+uv run llm-fallback --config config.yaml [--host 0.0.0.0] [--port 8000]
 ```
 
 ## Docker
@@ -123,9 +125,10 @@ curl http://localhost:8000/v1/chat/completions \
 126 tests covering config validation, provider routing, authentication,
 fallback logic, cooldown behaviour, Wake-on-LAN, and header forwarding.
 
+Development dependencies are installed by `uv sync`. Run the test suite with:
+
 ```bash
-pip install pytest
-python -m pytest tests/ -v
+uv run pytest tests/ -v
 ```
 
 Works on both Linux and Windows. No external services required — all backend

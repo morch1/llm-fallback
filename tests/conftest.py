@@ -1,17 +1,4 @@
-import importlib.util
-import sys
-from pathlib import Path
-
 import pytest
-
-# Import llm-fallback.py (hyphenated) as 'llm_fallback'
-_spec = importlib.util.spec_from_file_location(
-    "llm_fallback",
-    str(Path(__file__).resolve().parent.parent / "llm-fallback.py"),
-)
-_llm_fallback = importlib.util.module_from_spec(_spec)
-sys.modules["llm_fallback"] = _llm_fallback
-_spec.loader.exec_module(_llm_fallback)
 
 
 @pytest.fixture
